@@ -44,6 +44,13 @@ Market rules:
     Where the band is narrower than one tick (a low-priced HNX or UPCoM
     share), the rounded ceiling or floor would equal the reference price;
     the exchange then sets it one tick away, so the stock can still move.
+  - The grid is the traded price's. Prices adjusted for later dividends and
+    bonus issues put older sessions at a fraction of what traded: a share
+    that traded at 60,000 VND on HOSE's 100 VND tick can read 25,000 VND,
+    where the tick is 50, and HNX's and UPCoM's flat 100 VND becomes a larger
+    share of the price. ``vn_price_factor`` gives the traded price over the
+    run's price by date; the reference price, the band and every fill are
+    then worked out on the traded price and converted back.
   - Round lot: 100 shares. The exchanges also accept odd-lot orders of 1-99
     shares in a separate board that daily bars cannot represent, so odd-lot
     trading is deliberately not modelled and sub-lot orders round to zero.
@@ -78,13 +85,15 @@ from __future__ import annotations
 import bisect
 import logging
 import math
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 import pandas as pd
 
 from backtest.engines.base import BaseEngine
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # HOSE quotation price units (bước giá) for shares and fund certificates:
 # (lower bound inclusive, tick) in VND. Every coarser tick is an exact multiple
@@ -183,6 +192,76 @@ def _session_day(ts: object) -> Optional[pd.Timestamp]:
     return day.normalize()
 
 
+def _parse_dated(
+    key: str, noun: str, value: object, read: Callable[[object], _T]
+) -> dict[str, tuple[tuple[pd.Timestamp, ...], tuple[_T, ...]]]:
+    """Validate a ``{symbol: {date: value}}`` config value.
+
+    Args:
+        key: Config key, for error messages.
+        noun: What each date maps to, for error messages.
+        value: The config value; ``None`` or an empty mapping means none.
+        read: Parses one raw value, raising ``ValueError`` with the reason
+            when it is not valid.
+
+    Returns:
+        Per symbol, its dates in ascending order and the value from each.
+
+    Raises:
+        ValueError: When the value is not a mapping of non-empty mappings, a
+            date does not parse, *read* refuses a value, or two entries fall
+            on the same day.
+    """
+    if not value:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{key} must map each symbol to {{date: {noun}}}, "
+            f"got {type(value).__name__}"
+        )
+    parsed: dict[str, tuple[tuple[pd.Timestamp, ...], tuple[_T, ...]]] = {}
+    for symbol, entries in value.items():
+        if not isinstance(entries, dict) or not entries:
+            raise ValueError(
+                f"{key}[{symbol!r}] must be a non-empty {{date: {noun}}} mapping"
+            )
+        by_day: dict[pd.Timestamp, _T] = {}
+        for raw_day, raw in entries.items():
+            try:
+                day = _session_day(raw_day)
+            except (TypeError, ValueError):
+                day = None
+            if day is None:
+                raise ValueError(f"{key}[{symbol!r}]: {raw_day!r} is not a date")
+            try:
+                item = read(raw)
+            except ValueError as exc:
+                raise ValueError(f"{key}[{symbol!r}][{raw_day!r}]: {exc}") from None
+            if day in by_day:
+                raise ValueError(f"{key}[{symbol!r}]: two entries on {day.date()}")
+            by_day[day] = item
+        days = tuple(sorted(by_day))
+        parsed[str(symbol)] = (days, tuple(by_day[d] for d in days))
+    return parsed
+
+
+def _read_exchange(raw: object) -> str:
+    exchange = _EXCHANGE_NAMES.get(str(raw).strip().upper())
+    if exchange is None:
+        raise ValueError(f"unknown exchange {raw!r}; use HOSE, HNX or UPCOM")
+    return exchange
+
+
+def _read_factor(raw: object) -> float:
+    try:
+        factor = float(raw)
+    except (TypeError, ValueError):
+        factor = math.nan
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError(f"factor {raw!r} is not a positive number")
+    return factor
+
+
 def parse_exchange_history(
     history: object,
 ) -> dict[str, tuple[tuple[pd.Timestamp, ...], tuple[str, ...]]]:
@@ -204,44 +283,33 @@ def parse_exchange_history(
             date does not parse, an exchange is unknown, or two entries fall
             on the same day.
     """
-    if not history:
-        return {}
-    if not isinstance(history, dict):
-        raise ValueError(
-            "vn_exchange_history must map each symbol to {date: exchange}, "
-            f"got {type(history).__name__}"
-        )
-    parsed: dict[str, tuple[tuple[pd.Timestamp, ...], tuple[str, ...]]] = {}
-    for symbol, listings in history.items():
-        if not isinstance(listings, dict) or not listings:
-            raise ValueError(
-                f"vn_exchange_history[{symbol!r}] must be a non-empty "
-                "{date: exchange} mapping"
-            )
-        by_day: dict[pd.Timestamp, str] = {}
-        for raw_day, raw_exchange in listings.items():
-            try:
-                day = _session_day(raw_day)
-            except (TypeError, ValueError):
-                day = None
-            if day is None:
-                raise ValueError(
-                    f"vn_exchange_history[{symbol!r}]: {raw_day!r} is not a date"
-                )
-            exchange = _EXCHANGE_NAMES.get(str(raw_exchange).strip().upper())
-            if exchange is None:
-                raise ValueError(
-                    f"vn_exchange_history[{symbol!r}][{raw_day!r}]: unknown "
-                    f"exchange {raw_exchange!r}; use HOSE, HNX or UPCOM"
-                )
-            if day in by_day:
-                raise ValueError(
-                    f"vn_exchange_history[{symbol!r}]: two entries on {day.date()}"
-                )
-            by_day[day] = exchange
-        days = tuple(sorted(by_day))
-        parsed[str(symbol)] = (days, tuple(by_day[d] for d in days))
-    return parsed
+    return _parse_dated("vn_exchange_history", "exchange", history, _read_exchange)
+
+
+def parse_price_factor(
+    factors: object,
+) -> dict[str, tuple[tuple[pd.Timestamp, ...], tuple[float, ...]]]:
+    """Validate the ``vn_price_factor`` config value.
+
+    Args:
+        factors: ``{symbol: {date: factor}}``, keyed by the run's codes, where
+            each factor is the traded price over the run's price from its
+            date, the first session it applies (the earliest only has to
+            precede the data), e.g.
+            ``{"FPT.VN": {"2019-01-02": 2.4, "2023-06-12": 1.0}}``. On
+            adjusted prices that is the raw close over the adjusted close,
+            which changes only on ex-dates. ``None`` or an empty mapping means
+            the run's prices are the traded prices.
+
+    Returns:
+        Per symbol, its dates in ascending order and the factor from each.
+
+    Raises:
+        ValueError: When the value is not a mapping of non-empty mappings, a
+            date does not parse, a factor is not a positive finite number, or
+            two entries fall on the same day.
+    """
+    return _parse_dated("vn_price_factor", "factor", factors, _read_factor)
 
 
 def vn_tick_size(price: float, exchange: str = "HOSE") -> float:
@@ -392,13 +460,10 @@ def hose_is_settled(
     return (int(current_idx) - int(entry_idx)) >= int(settlement_bars)
 
 
-def hose_base_price(
-    state: BaseEngine,
-    symbol: str,
-    bar: pd.Series,
-    exchange: Optional[str] = None,
+def hose_reference_price(
+    state: BaseEngine, symbol: str, bar: pd.Series
 ) -> Optional[float]:
-    """Resolve the reference price (giá tham chiếu) for *symbol* on this bar.
+    """Return the unrounded reference price for *symbol* on this bar.
 
     Both sources are strictly historical, so neither leaks the decision bar's
     own close into the pre-fill check:
@@ -406,8 +471,42 @@ def hose_base_price(
       2. The previous row of the close panel that :class:`BaseEngine`
          pre-extracts for the run.
 
-    An off-grid close is rounded onto the grid, since a reference price is
-    always a tradeable price.
+    Args:
+        state: Engine holding the run's close panel and bar cursor.
+        symbol: Symbol whose reference price is wanted.
+        bar: Current bar.
+
+    Returns:
+        The price in the run's units, or ``None`` when no historical close is
+        reachable (first bar of a run, or a rule book with no panel).
+    """
+    if "pre_close" in bar.index:
+        raw = bar["pre_close"]
+        if pd.notna(raw) and float(raw) > 0:
+            return float(raw)
+
+    close_arr = getattr(state, "_close_arr", None)
+    col = getattr(state, "_code_to_col", {}).get(symbol)
+    row = getattr(state, "_bar_idx", 0) - 1
+    if close_arr is not None and col is not None and row >= 0:
+        raw = close_arr[row, col]
+        if pd.notna(raw) and float(raw) > 0:
+            return float(raw)
+    return None
+
+
+def hose_base_price(
+    state: BaseEngine,
+    symbol: str,
+    bar: pd.Series,
+    exchange: Optional[str] = None,
+    factor: float = 1.0,
+) -> Optional[float]:
+    """Resolve the reference price (giá tham chiếu) for *symbol* on this bar.
+
+    The price comes from :func:`hose_reference_price`. An off-grid close is
+    rounded onto the grid, since a reference price is always a tradeable
+    price.
 
     Args:
         state: Engine holding the run's close panel and bar cursor.
@@ -415,29 +514,18 @@ def hose_base_price(
         bar: Current bar.
         exchange: Exchange whose tick grid the price is rounded onto; defaults
             to the symbol's suffix (``vn_exchange``).
+        factor: Traded price over the run's price on this bar (see
+            :meth:`VietnamEquityEngine.price_factor`); the price is rounded on
+            the traded price's grid and returned in the run's units.
 
     Returns:
-        The reference price in VND, or ``None`` when no historical close is
-        reachable (first bar of a run, or a rule book with no panel).
+        The reference price in the run's units, or ``None`` when no historical
+        close is reachable (first bar of a run, or a rule book with no panel).
     """
-    candidate: Optional[float] = None
-    if "pre_close" in bar.index:
-        raw = bar["pre_close"]
-        if pd.notna(raw) and float(raw) > 0:
-            candidate = float(raw)
-
-    if candidate is None:
-        close_arr = getattr(state, "_close_arr", None)
-        col = getattr(state, "_code_to_col", {}).get(symbol)
-        row = getattr(state, "_bar_idx", 0) - 1
-        if close_arr is not None and col is not None and row >= 0:
-            raw = close_arr[row, col]
-            if pd.notna(raw) and float(raw) > 0:
-                candidate = float(raw)
-
+    candidate = hose_reference_price(state, symbol, bar)
     if candidate is None:
         return None
-    return vn_round_down(candidate, exchange or vn_exchange(symbol))
+    return vn_round_down(candidate * factor, exchange or vn_exchange(symbol)) / factor
 
 
 def hose_can_execute(
@@ -454,7 +542,10 @@ def hose_can_execute(
     trades on that day: ±7% on HOSE's grid, ±10% and ±15% on HNX's and UPCoM's
     flat 100-VND grid. That exchange is the suffix's (``vn_exchange``) unless
     the run's ``vn_exchange_history`` dates a move (see
-    :meth:`VietnamEquityEngine.listing_on`).
+    :meth:`VietnamEquityEngine.listing_on`). The reference price, the band and
+    the prospective fill are compared in traded prices, the run's prices times
+    the ``vn_price_factor`` of the bar (see
+    :meth:`VietnamEquityEngine.price_factor`).
 
     A single-market run passes the same engine as both arguments. A composite
     run cannot: it owns the positions, fill ledger, bar cursor and close panel
@@ -492,8 +583,8 @@ def hose_can_execute(
         return True
 
     exchange = rules.exchange_on(symbol, ts)
-    base_price = hose_base_price(state, symbol, bar, exchange)
-    if base_price is None:
+    reference = hose_reference_price(state, symbol, bar)
+    if reference is None:
         if not rules._limit_base_warned:
             rules._limit_base_warned = True
             logger.warning(
@@ -510,11 +601,14 @@ def hose_can_execute(
     if open_price <= 0:
         return True  # order sizing rejects non-positive prices downstream
 
+    # Bounds and fill are compared in traded prices, on the traded grid.
+    factor = rules.price_factor(symbol, ts)
+    base_price = vn_round_down(reference * factor, exchange)
     upper, lower = vn_price_limits(base_price, band, exchange)
     # A composite's rule book was last synced to whichever symbol and bar it
     # served before, so the fill is priced for this symbol's grid explicitly.
-    fill_price = rules.slipped_price(
-        symbol, open_price, direction if direction else -1, ts
+    fill_price = rules.slipped_traded_price(
+        symbol, open_price * factor, direction if direction else -1, ts
     )
     if direction == 1 and fill_price >= upper - _PRICE_EPS:
         return False  # giá trần: no ask to buy from
@@ -573,6 +667,13 @@ class VietnamEquityEngine(BaseEngine):
       - vn_volume_cap: share of a session's traded volume one order may fill,
         default 0.10; ``0`` / ``None`` disables it. The rest of a larger order
         keeps working on the following sessions
+      - vn_price_factor: ``{symbol: {date: factor}}`` for runs on adjusted
+        prices, each factor being the traded price over the run's price from
+        that date (the first session it applies). The symbol's reference
+        price, band and fills are then worked out on the traded price's tick
+        grid and converted back. Unlisted symbols, and bars before a symbol's
+        earliest date, take a factor of 1. Volume is not rescaled: scale it in
+        the data (see :meth:`fill_cap`)
 
     Raises:
         ValueError: When ``allow_short`` is truthy. Routine short selling is
@@ -608,6 +709,8 @@ class VietnamEquityEngine(BaseEngine):
         self.exchange_history = parse_exchange_history(
             config.get("vn_exchange_history")
         )
+        # Dated traded-over-run price factor, for runs on adjusted prices.
+        self.price_factors = parse_price_factor(config.get("vn_price_factor"))
         volume_cap = config.get("vn_volume_cap", _DEFAULT_VOLUME_CAP)
         self.volume_cap = float(volume_cap or 0.0)
         if not math.isfinite(self.volume_cap) or not 0.0 <= self.volume_cap <= 1.0:
@@ -646,6 +749,26 @@ class VietnamEquityEngine(BaseEngine):
     def exchange_on(self, symbol: str, ts: object = None) -> str:
         """Return the exchange *symbol* trades on at *ts* (see :meth:`listing_on`)."""
         return self.listing_on(symbol, ts)[0]
+
+    def price_factor(self, symbol: str, ts: object = None) -> float:
+        """Return the traded price over the run's price for *symbol* at *ts*.
+
+        Args:
+            symbol: Vietnamese symbol (``VIC.VN``, ``PVS.HNX``, ``ACV.UPCOM``).
+            ts: Bar timestamp; ``None`` (no bar, as outside a run) reads 1.
+
+        Returns:
+            The factor the run's ``vn_price_factor`` dates on or before *ts*,
+            and 1.0 when the symbol has none or *ts* falls before its earliest
+            date.
+        """
+        history = self.price_factors.get(symbol)
+        day = _session_day(ts)
+        if history is None or day is None:
+            return 1.0
+        days, factors = history
+        k = bisect.bisect_right(days, day) - 1
+        return factors[k] if k >= 0 else 1.0
 
     def band_for(self, symbol: str, ts: object = None) -> Optional[float]:
         """Return the daily price band applying to *symbol* on the bar at *ts*.
@@ -748,12 +871,13 @@ class VietnamEquityEngine(BaseEngine):
             bar: Current bar.
 
         Returns:
-            The reference price in VND, or ``None`` when no historical close is
-            reachable (first bar of a run, or a composite sub-engine).
+            The reference price in the run's units, on the traded price's grid
+            (see :func:`hose_base_price`), or ``None`` when no historical close
+            is reachable (first bar of a run, or a composite sub-engine).
         """
-        return hose_base_price(
-            self, symbol, bar, self.exchange_on(symbol, self._bar_ts)
-        )
+        ts = self._bar_ts
+        exchange, factor = self.exchange_on(symbol, ts), self.price_factor(symbol, ts)
+        return hose_base_price(self, symbol, bar, exchange, factor)
 
     def round_size(self, raw_size: float, price: float) -> float:
         """Floor the order to whole 100-share board lots.
@@ -804,17 +928,38 @@ class VietnamEquityEngine(BaseEngine):
 
         A slipped price is snapped away from the trader — buys up to the next
         valid ask, sells down to the next valid bid — because no fill can land
-        between ticks.
+        between ticks. The grid is the traded price's: *price* is converted
+        with :meth:`price_factor`, slipped on that grid and converted back.
 
         Args:
             symbol: Vietnamese symbol; its exchange selects the tick grid.
-            price: Reference price in VND.
+            price: Reference price in the run's units.
+            direction: 1 to buy, -1 to sell.
+            ts: Bar timestamp; with a ``vn_exchange_history`` it selects the
+                exchange (see :meth:`listing_on`), with a ``vn_price_factor``
+                the factor.
+
+        Returns:
+            In the run's units, a price that is valid on the symbol's exchange
+            once converted, never below one tick.
+        """
+        factor = self.price_factor(symbol, ts)
+        return self.slipped_traded_price(symbol, price * factor, direction, ts) / factor
+
+    def slipped_traded_price(
+        self, symbol: str, price: float, direction: int, ts: object = None
+    ) -> float:
+        """Slip a traded *price* against the trader onto its exchange's tick grid.
+
+        Args:
+            symbol: Vietnamese symbol; its exchange selects the tick grid.
+            price: Traded price in VND.
             direction: 1 to buy, -1 to sell.
             ts: Bar timestamp; with a ``vn_exchange_history`` it selects the
                 exchange (see :meth:`listing_on`).
 
         Returns:
-            A valid price on the symbol's exchange, never below one tick.
+            A valid traded price on the symbol's exchange, never below one tick.
         """
         exchange = self.exchange_on(symbol, ts)
         slipped = price * (1 + direction * self.slippage_rate)
@@ -830,8 +975,8 @@ class VietnamEquityEngine(BaseEngine):
             direction: 1 to buy, -1 to sell.
 
         Returns:
-            A valid price on the exchange of the symbol being filled
-            (``BaseEngine`` sets ``_active_symbol`` before every fill, and
-            ``_bar_ts`` on every bar).
+            The fill price in the run's units, on the traded tick grid of the
+            symbol being filled (``BaseEngine`` sets ``_active_symbol`` before
+            every fill, and ``_bar_ts`` on every bar; see :meth:`slipped_price`).
         """
         return self.slipped_price(self._active_symbol, price, direction, self._bar_ts)
