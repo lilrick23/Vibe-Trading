@@ -53,6 +53,7 @@ def test_every_config_key_the_skill_names_is_read_by_the_engine() -> None:
         "vn_settlement_bars",
         "vn_exchange_history",
         "vn_volume_cap",
+        "vn_price_factor",
         "price_limit",
     } <= named
     for key in named:
